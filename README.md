@@ -1,6 +1,6 @@
 # 🚀 LaunchUp
 
-![LaunchUp Banner](https://capsule-render.vercel.app/api?type=waving&color=gradient&height=300&section=header&text=LaunchUp&fontSize=80&animation=fadeIn&fontAlignY=38&desc=Startup%20Assessment%20%26%20Readiness%20Platform&descAlignY=51&descSize=20)
+![LaunchUp Banner](https://capsule-render.vercel.app/api?type=waving&color=gradient&height=300&section=header&text=LaunchUp&fontSize=80&animation=fadeIn&fontAlignY=38&desc=Startup%20Assessment%20and%20Readiness%20Platform&descAlignY=51&descSize=20)
 
 <div align="center">
 
