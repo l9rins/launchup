@@ -57,6 +57,10 @@ import {
 // It is truthy, so it wins any `||` fallback unless matched explicitly.
 const OCR_PLACEHOLDER_PREFIX = /^OCR_PLACEHOLDER:/;
 
+// Below this many non-space characters a PDF's text layer is a scanner
+// watermark ("CamScanner") or nothing, so its pages are read as images.
+const MIN_PDF_TEXT_CHARS = 100;
+
 @Injectable()
 export class StartupService {
   constructor(
@@ -222,6 +226,7 @@ export class StartupService {
       await this.em.flush();
 
       await this.createStartupProposal(startup, dto);
+      await this.linkOcrDocument(startup, dto.ocrDocumentHash);
 
       if (startup.capsuleProposal) {
         await this.aiService.recordRagContext(
@@ -235,8 +240,8 @@ export class StartupService {
 
   /**
    * One row per distinct upload. Re-parsing the same bytes refreshes that row
-   * instead of leaving another orphan behind — nothing links these to a startup
-   * at parse time, since parsing happens before the startup exists.
+   * instead of leaving another orphan behind. Parsing happens before the
+   * startup exists, so the link is made on submit by linkOcrDocument.
    */
   private async upsertOcrDocument(
     contentHash: string,
@@ -255,6 +260,19 @@ export class StartupService {
     const created = this.em.create(OcrDocument, { ...data, contentHash });
     await this.em.persistAndFlush(created);
     return created;
+  }
+
+  /**
+   * Attaches the parsed upload to the startup it was submitted with, so
+   * retention pruning keeps it. A row already linked elsewhere stays put:
+   * the hash proves someone had the bytes, not that they own the record.
+   */
+  private async linkOcrDocument(startup: Startup, contentHash?: string) {
+    if (!contentHash) return;
+    const doc = await this.em.findOne(OcrDocument, { contentHash });
+    if (!doc || doc.startup) return;
+    doc.startup = startup;
+    await this.em.flush();
   }
 
   async parseCapsuleProposal(file: Express.Multer.File, ctx: AiRunContext) {
@@ -308,6 +326,8 @@ export class StartupService {
         legibilityReason: legibility.reason,
         imageWidth: legibility.width,
         imageHeight: legibility.height,
+        // Sent back on submit so the upload can be linked to the startup.
+        documentHash: contentHash,
       };
     }
 
@@ -319,28 +339,8 @@ export class StartupService {
 
     if (file.mimetype.startsWith('image/')) {
       // Primary path: Gemini Vision beats Tesseract by a wide margin on handwriting.
-      try {
-        aiPayload = await this.aiService.getCapsuleProposalInfoFromImage(
-          ctx,
-          file.buffer,
-          file.mimetype,
-        );
-        visionSucceeded = true;
-      } catch (err) {
-        // Degrading to Tesseract when the service is simply unreachable produced
-        // verified-looking garbage on 2026-08-22: Tesseract mangles handwriting,
-        // a second call extracts fields from the mangling, and those fields then
-        // match it perfectly. Better to say so and let the user retry.
-        if (isServiceFailure(err)) {
-          throw new ServiceUnavailableException(
-            isQuotaError(err)
-              ? aiUnavailableMessage(err)
-              : 'The AI service is busy right now. Please try uploading again in a moment.',
-            { cause: err },
-          );
-        }
-        console.error('[OCR] Gemini Vision extraction failed, falling back to Tesseract:', err);
-      }
+      aiPayload = await this.extractWithVision(ctx, file);
+      visionSucceeded = aiPayload !== null;
 
       // Tesseract still needed for raw text and sketch detection.
       try {
@@ -409,10 +409,17 @@ export class StartupService {
           legibilityReason: err instanceof Error ? err.message : String(err),
           imageWidth: null,
           imageHeight: null,
+          // Sent back on submit so the upload can be linked to the startup.
+          documentHash: contentHash,
         };
       }
 
-      aiPayload = await this.extractFieldsFromText(ctx, parsedText);
+      // A scanned PDF is page images with no text layer; Gemini reads those pages directly.
+      if (parsedText.replace(/\s/g, '').length < MIN_PDF_TEXT_CHARS) {
+        aiPayload = await this.extractWithVision(ctx, file);
+        visionSucceeded = aiPayload !== null;
+      }
+      if (!aiPayload) aiPayload = await this.extractFieldsFromText(ctx, parsedText);
     }
 
     const cleanPayload = aiPayload
@@ -453,7 +460,7 @@ export class StartupService {
     // Gemini reads handwriting far better than Tesseract, so its transcription
     // wins whenever there is one. `parsedText` deliberately stays Tesseract's:
     // detectSketch already scored it above and its weights are tuned to that
-    // output, not to clean prose. PDFs have no raw_transcription and fall back.
+    // output, not to clean prose. Text-layer PDFs have no raw_transcription and fall back.
     const transcription: string =
       parsedPayload.raw_transcription ||
       (OCR_PLACEHOLDER_PREFIX.test(parsedText) ? '' : parsedText);
@@ -502,8 +509,39 @@ export class StartupService {
       legibilityReason: legibility.reason,
       imageWidth: legibility.width,
       imageHeight: legibility.height,
+      // Sent back on submit so the upload can be linked to the startup.
+      documentHash: contentHash,
     };
   }
+
+  /** Gemini Vision extraction; null on a model error worth falling back from. */
+  private async extractWithVision(
+    ctx: AiRunContext,
+    file: Express.Multer.File,
+  ): Promise<string | null> {
+    try {
+      return (
+        (await this.aiService.getCapsuleProposalInfoFromImage(ctx, file.buffer, file.mimetype)) ??
+        null
+      );
+    } catch (err) {
+      // Degrading to Tesseract when the service is simply unreachable produced
+      // verified-looking garbage on 2026-08-22: Tesseract mangles handwriting,
+      // a second call extracts fields from the mangling, and those fields then
+      // match it perfectly. Better to say so and let the user retry.
+      if (isServiceFailure(err)) {
+        throw new ServiceUnavailableException(
+          isQuotaError(err)
+            ? aiUnavailableMessage(err)
+            : 'The AI service is busy right now. Please try uploading again in a moment.',
+          { cause: err },
+        );
+      }
+      console.error('[OCR] Gemini Vision extraction failed, falling back to text extraction:', err);
+      return null;
+    }
+  }
+
   private async createStartupProposal(
     startup: Startup,
     dto: StartupApplicationDto,
@@ -1117,18 +1155,18 @@ export class StartupService {
 
     startup.qualificationStatus = QualificationStatus.QUALIFIED;
 
-    // Only flagged approvals are logged. Logging every approval would turn the
-    // record of "approved against a warning" into an access log.
-    if (flagged) {
-      this.em.create(ActivityLog, {
-        action: 'Manager',
-        actor: opts.actor,
-        details:
-          `Approved startup ${startupId} despite a predominantly-positive analysis summary ` +
-          `(verdict ${verdict?.source}${verdict?.runId ? `, run ${verdict.runId}` : ''}).`,
-        createdAt: new Date(),
-      });
-    }
+    // SRS 2.0, 1.3: every approval is logged with the Manager and the verdict.
+    // An override keeps its own wording so it stays findable in the feed.
+    const run = verdict?.runId ? `, run ${verdict.runId}` : '';
+    this.em.create(ActivityLog, {
+      action: 'Manager',
+      actor: opts.actor,
+      details: flagged
+        ? `Approved startup ${startupId} despite a predominantly-positive analysis summary ` +
+          `(verdict ${verdict?.source}${run}).`
+        : `Approved startup ${startupId} (summary verdict ${verdict?.status ?? 'none'}${run}).`,
+      createdAt: new Date(),
+    });
 
     await this.em.flush();
     return { message: `Startup with ID ${startupId} has been approved.` };
@@ -1572,6 +1610,7 @@ export class StartupService {
     // Editing the proposal is a reapplication, so it re-enters review.
     startup.qualificationStatus = QualificationStatus.PENDING;
 
+    await this.linkOcrDocument(startup, dto.ocrDocumentHash);
     await this.afterProposalEdit(startup, proposal);
 
     return startup;
@@ -1624,6 +1663,9 @@ export class StartupService {
 
     const proposal = startup.capsuleProposal;
     const before = this.proposalText(proposal);
+
+    // Before the no-change check: an upload can match the saved text exactly.
+    await this.linkOcrDocument(startup, dto.ocrDocumentHash);
 
     if (dto.title !== undefined) proposal.title = dto.title;
     if (dto.description !== undefined) proposal.description = dto.description;

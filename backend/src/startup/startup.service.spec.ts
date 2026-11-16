@@ -13,6 +13,10 @@ import {
 } from '@nestjs/common';
 import { createHash } from 'crypto';
 
+// The text layer pdf-parse finds; a scanned PDF has none.
+let mockPdfText = '';
+jest.mock('pdf-parse', () => jest.fn(async () => ({ text: mockPdfText })));
+
 /**
  * First spec for src/startup/. Scoped to the summary path only — the service is
  * ~1400 lines and broad coverage is a different task. This path had none, which
@@ -164,15 +168,36 @@ describe('StartupService.approveApplicant — SO 4.4 acknowledgement gate', () =
     expect(logs[0].details).toContain('42');
   });
 
-  it('approves a balanced summary with no acknowledgement and logs nothing', async () => {
-    const { service, startup, logs } = buildForApproval(BALANCED);
+  it('approves a balanced summary with no acknowledgement', async () => {
+    const { service, startup } = buildForApproval(BALANCED);
 
     await service.approveApplicant(42);
 
     expect(startup.qualificationStatus).toBe(QualificationStatus.QUALIFIED);
-    // The log means "approved against a warning". Logging every approval would
-    // dilute it into an access log.
-    expect(logs).toHaveLength(0);
+  });
+
+  // SRS 2.0, 1.3: every approval is logged with the Manager and the verdict.
+  it('logs a balanced approval with who approved it and the verdict', async () => {
+    const { service, logs } = buildForApproval(BALANCED);
+
+    await service.approveApplicant(42, { actor: 'manager@launchup.local' });
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0].actor).toBe('manager@launchup.local');
+    expect(logs[0].details).toContain('42');
+    expect(logs[0].details).toContain('balanced');
+  });
+
+  // The override must stay findable among routine approvals in the feed.
+  it('words a flagged override differently from a routine approval', async () => {
+    const flagged = buildForApproval(LENIENT);
+    const routine = buildForApproval(BALANCED);
+
+    await flagged.service.approveApplicant(42, { acknowledged: true });
+    await routine.service.approveApplicant(42);
+
+    expect(flagged.logs[0].details).toContain('despite');
+    expect(routine.logs[0].details).not.toContain('despite');
   });
 
   // The one defect in this feature that no mock could catch, pinned at the only
@@ -804,5 +829,134 @@ describe('StartupService.parseCapsuleProposal — duplicate uploads', () => {
     expect(ocrDocs[0].extractedText).toBe(
       'AgriTrace: An IoT-Enabled Cold Chain Monitoring System',
     );
+  });
+});
+
+/**
+ * A scanned PDF (a phone scan, CamScanner) is page images with no text layer.
+ * pdf-parse returned "\n\n" for one on 2026-11-15, and every field came back empty.
+ */
+describe('StartupService.parseCapsuleProposal — scanned PDFs', () => {
+  const pdfFile = {
+    mimetype: 'application/pdf',
+    originalname: 'Sample Proposal.pdf',
+    buffer: Buffer.from('%PDF-1.7 scanned'),
+  } as any;
+
+  it('reads a PDF with no text layer through Gemini Vision', async () => {
+    mockPdfText = '\n\nCamScanner';
+    const { service, ocrDocs, aiService } = buildOcr({ tesseractText: '', visionJson: VISION_JSON });
+
+    const result: any = await service.parseCapsuleProposal(pdfFile, ctx);
+
+    expect(aiService.getCapsuleProposalInfoFromImage).toHaveBeenCalledWith(
+      ctx,
+      pdfFile.buffer,
+      'application/pdf',
+    );
+    expect(result.title).toBe('AgriTrace');
+    expect(ocrDocs[0].extractedText).toBe(
+      'AgriTrace: An IoT-Enabled Cold Chain Monitoring System',
+    );
+  });
+
+  it('keeps text extraction for a PDF that has a text layer', async () => {
+    mockPdfText = 'AgriTrace: An IoT-Enabled Cold Chain Monitoring System. '.repeat(5);
+    const { service, aiService } = buildOcr({ tesseractText: '', visionJson: VISION_JSON });
+
+    await service.parseCapsuleProposal(pdfFile, ctx);
+
+    expect(aiService.getCapsuleProposalInfoFromImage).not.toHaveBeenCalled();
+    expect(aiService.getCapsuleProposalInfo).toHaveBeenCalled();
+  });
+
+  // The upload queue only catches a 503; anything else would lose the file.
+  it('raises a busy model on a scanned PDF as a 503', async () => {
+    mockPdfText = '\n\n';
+    const { service, ocrDocs } = buildOcr({
+      tesseractText: '',
+      visionJson: VISION_JSON,
+      visionError: 'got status: 503 Service Unavailable. {"error":{"code":503}}',
+    });
+
+    await expect(service.parseCapsuleProposal(pdfFile, ctx)).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
+    expect(ocrDocs).toHaveLength(0);
+  });
+});
+
+/**
+ * Parsing runs before the startup exists, so nothing linked an upload to its
+ * application and retention pruned every one of them (KD-17).
+ */
+describe('StartupService — linking the uploaded document on submit', () => {
+  const HASH = 'a'.repeat(64);
+  const summary: StartupAnalysisSummary = {
+    summary: 'S.',
+    unmetCriteria: [],
+    criticalRisks: [],
+    source: 'schema',
+  };
+
+  function buildWithDoc(doc: any) {
+    const built = build(summary);
+    built.em.findOne.mockImplementation(async (entity: unknown, where: any) => {
+      if (entity === OcrDocument) return where?.contentHash === doc?.contentHash ? doc : null;
+      return entity === Startup ? built.startup : { id: 7 };
+    });
+    return built;
+  }
+
+  it('returns the content hash from the parse so the form can send it back', async () => {
+    const { service } = buildOcr({ tesseractText: 'noise', visionJson: VISION_JSON });
+
+    const parsed = await service.parseCapsuleProposal(imageFile, ctx);
+
+    expect(parsed.documentHash).toBe(
+      createHash('sha256').update(imageFile.buffer).digest('hex'),
+    );
+  });
+
+  it('links the uploaded document to the new startup', async () => {
+    const doc: any = { id: 3, contentHash: HASH, startup: undefined };
+    const { service, startup } = buildWithDoc(doc);
+
+    await service.create({ ...dto, ocrDocumentHash: HASH }, 7);
+
+    expect(doc.startup).toBe(startup);
+  });
+
+  it('leaves a typed-in application without a document', async () => {
+    const doc: any = { id: 3, contentHash: HASH, startup: undefined };
+    const { service, em } = buildWithDoc(doc);
+
+    await service.create(dto, 7);
+
+    expect(doc.startup).toBeUndefined();
+    expect(em.findOne).not.toHaveBeenCalledWith(OcrDocument, expect.anything());
+  });
+
+  // The same bytes uploaded by a second founder must not move the first's record.
+  it('does not take a document already linked to another startup', async () => {
+    const other = { id: 99 };
+    const doc: any = { id: 3, contentHash: HASH, startup: other };
+    const { service } = buildWithDoc(doc);
+
+    await service.create({ ...dto, ocrDocumentHash: HASH }, 7);
+
+    expect(doc.startup).toBe(other);
+  });
+
+  it('links a new version uploaded to an existing startup, even when its text is unchanged', async () => {
+    const { service, startup, em } = buildForEdit(QualificationStatus.QUALIFIED);
+    const doc: any = { id: 4, contentHash: HASH, startup: undefined };
+    em.findOne.mockImplementation(async (entity: unknown) =>
+      entity === OcrDocument ? doc : startup,
+    );
+
+    await service.updateCapsuleProposalFields(42, { title: 'PondSense', ocrDocumentHash: HASH });
+
+    expect(doc.startup).toBe(startup);
   });
 });
