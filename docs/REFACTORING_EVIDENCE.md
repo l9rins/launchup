@@ -17,6 +17,10 @@ Significant changes to the inherited LaunchUp codebase, with the commit or pull 
 | Leniency flag threshold | `flagged = criticalCount === 0`, measured to fire 0/10 | `flagged = ratio < 0.75`, validated on a held-out run | PR #26, [67f6071](https://github.com/l9rins/launchup/commit/67f6071) |
 | AI error handling | Gemini 429/503 surfaced as a 500 | Readable 503, retry on 503, daily quota told apart from per-minute limit | [8eb4bc6](https://github.com/l9rins/launchup/commit/8eb4bc6), [cd6c3b1](https://github.com/l9rins/launchup/commit/cd6c3b1) |
 | AI quota indicator | Users hit the limit with no warning | Backend counts every Gemini call; pages show requests left and reset time | [a9d4971](https://github.com/l9rins/launchup/commit/a9d4971) |
+| AI retry queue | A refused Gemini call (429/503/quota) failed and the user had to retry by hand | Refused generation is stored in `ai_generation_jobs` and retried with backoff; proposal uploads are queued too | [fd316a2](https://github.com/l9rins/launchup/commit/fd316a2), [257c62f](https://github.com/l9rins/launchup/commit/257c62f) |
+| Normalization baseline | The built backend never found `ai-baseline.json`, so every correction used mean 0 / std 1 | Baseline found from the build output; normalization is skipped and the audit marked unverified without a usable baseline | [99533da](https://github.com/l9rins/launchup/commit/99533da), [b919cf9](https://github.com/l9rins/launchup/commit/b919cf9) |
+| RNA fact check | Validation checked length and retrieval confidence only | Items that contradict the startup's scores or profile are marked and shown to Mentors | [b9a358e](https://github.com/l9rins/launchup/commit/b9a358e), [eb6b275](https://github.com/l9rins/launchup/commit/eb6b275) |
+| Schema sync on boot | `updateSchema()` dropped tables and columns the running code did not know | `updateSchema({ safe: true })` adds and alters, never drops | [3ef2647](https://github.com/l9rins/launchup/commit/3ef2647) |
 
 ## Security and roles
 
@@ -25,6 +29,9 @@ Significant changes to the inherited LaunchUp codebase, with the commit or pull 
 | Auth guards | 11 controllers had no guard; JWT secret had a fallback | Guards added; secret required | PR #11, [97690b7](https://github.com/l9rins/launchup/commit/97690b7) |
 | Three-role model per SRS §2.3 | Admin role plus a cookie-driven "Manager as Mentor" pseudo-role | Startup, Mentor, Manager. Existing Admin accounts converted to Manager on boot; separate founder and Manager logins | PR #49, [0d6b5f6](https://github.com/l9rins/launchup/commit/0d6b5f6) |
 | Startup read access (IDOR) | Any user could read any startup | Read endpoints scoped to owner, assigned mentor, or Manager | PR #50, [1400349](https://github.com/l9rins/launchup/commit/1400349) |
+| Admissions routes | Approve, waitlist, appoint/change mentor and mark complete checked login only | Manager-only (`AdminGuard`); a founder gets 403 | [b5d99ed](https://github.com/l9rins/launchup/commit/b5d99ed) |
+| Progress report access | Any signed-in user could read any startup's report | Same owner / mentor / Manager check as the other read endpoints | [b5275ae](https://github.com/l9rins/launchup/commit/b5275ae) |
+| Failed sign-in visibility | Failed sign-ins left no trace | Each one is logged to the Manager's Recent Activity | [eeb8c56](https://github.com/l9rins/launchup/commit/eeb8c56) |
 
 ## Deployment
 
